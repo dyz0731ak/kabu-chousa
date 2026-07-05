@@ -1,0 +1,77 @@
+# 株式調査兵団 自動更新＋デプロイ（LLM不使用）
+# - 平日 16:30 JST（大引け後）: データ更新 → ビルド → FTPデプロイ
+# - push時: ビルド → デプロイのみ（コード変更の即時反映）
+# - 毎月1日: JPX銘柄マスタも更新
+#
+# 必要な設定:
+#   Secrets : FTP_SERVER / FTP_USERNAME / FTP_PASSWORD（ConoHa WING）
+#   Variables（任意）: BASE_URL（未設定なら https://kabu-chousa.com）
+#                      FTP_SERVER_DIR（未設定なら ./ ）
+name: Update Data and Deploy
+
+on:
+  schedule:
+    - cron: '30 7 * * 1-5'   # UTC 07:30 = JST 16:30（平日）
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install yfinance xlrd
+
+      - name: Refresh JPX master (monthly or if missing)
+        if: github.event_name != 'push'
+        run: |
+          if [ ! -f data/master.json ] || [ "$(date +%d)" = "01" ]; then
+            python scripts/fetch_master.py
+          fi
+        continue-on-error: true
+
+      - name: Fetch market data (yfinance)
+        if: github.event_name != 'push'
+        run: python scripts/fetch_data.py --fund 600 --fin 250
+        continue-on-error: true   # 取得失敗時は前回データでビルド
+
+      - name: Build site
+        env:
+          BASE_URL: ${{ vars.BASE_URL || 'https://kabu-chousa.com' }}
+        run: python build.py
+
+      - name: Commit updated data
+        if: github.event_name != 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git diff --cached --quiet || git commit -m "chore: update market data [skip ci]"
+          git push
+        continue-on-error: true
+
+      - name: Deploy to ConoHa WING via FTP
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server: ${{ secrets.FTP_SERVER }}
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          local-dir: dist/
+          server-dir: ${{ vars.FTP_SERVER_DIR || './' }}
+          timeout: 600000
