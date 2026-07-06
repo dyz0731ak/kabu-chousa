@@ -8,27 +8,28 @@ Buffett Code的な企業分析 ＋ 株ドラゴン的なランキング ＋ Trad
 ```
 data.py                手書きの企業概要（DESC_OVERRIDES）。無い銘柄は自動テンプレ文
 scripts/fetch_master.py JPX上場銘柄一覧 → data/master.json（月1回）【LLM不使用】
-scripts/fetch_data.py   yfinance → data/market.json 等（毎営業日）【LLM不使用】
+scripts/fetch_data.py   株価=yfinance一括 / 指標・財務=かぶたん → data/*.json（毎営業日）【LLM不使用】
 build.py               静的サイト生成 → dist/（約3,800ページ）
 static/style.css       テーマCSS
 .github/workflows/deploy.yml  平日16:30 JST 自動更新→FTPデプロイ
 ```
 
-## データ取得の3層構造
+## データ取得の2層構造
 
-| 層 | 内容 | 頻度 |
-|---|---|---|
-| 株価・30日終値 | yf.download 一括バッチ（全銘柄・数分） | 毎回 |
-| 投資指標(.info) | PER/PBR/ROE/利回り/時価総額 | 古い順600銘柄/回（約1週間で一巡） |
-| 財務諸表 | 損益計算書・自己資本比率・年別配当 | 古い順250銘柄/回 |
+| 層 | ソース | 内容 | 頻度 |
+|---|---|---|---|
+| 株価・30日終値 | yfinance（無調整終値） | 一括バッチ・全銘柄・数分 | 毎回 |
+| 指標・財務 | かぶたん個別2ページ | 予想EPS/1株配・BPS・株数・ROE・自己資本比率・通期業績（予想行つき） | 古い順500銘柄/回（約1週間で一巡） |
 
-失敗した銘柄は既存値を温存し、翌回のローテーションで優先的に再取得する。
+- PER/PBR/利回り/時価総額は**ビルド時に「1株あたり値 × 最新株価」で毎日再計算**（四季報・証券会社と同じ予想ベース）
+- Yahoo(.info)の日本株ファンダはEPS・株数が古く不正確なため使わない（2026-07に確認）
+- 失敗した銘柄は既存値を温存し、翌回のローテーションで優先的に再取得する
 
 ## ビルド
 
 ```bash
 python3 scripts/fetch_master.py            # 初回・月1回
-python3 scripts/fetch_data.py              # 日次（--fund N --fin N で件数調整）
+python3 scripts/fetch_data.py              # 日次（--kabutan N で件数調整）
 python3 build.py                           # dist/ に生成
 BASE_URL=https://kabu.stock-overflow24.com python3 build.py   # サブドメイン公開時
 ```

@@ -2,24 +2,27 @@
 # -*- coding: utf-8 -*-
 """株式調査兵団 データ取得スクリプト（LLM不使用・cron/GitHub Actionsで定期実行）
 
-全上場銘柄（data/master.json ≈ 3,700銘柄）を対象に、規模に応じた3層で取得する:
+データソースと2層構造:
+  1. 株価・30日終値 : yfinance の一括バッチ（毎回・全銘柄・数分）※無調整終値
+  2. 指標・財務     : かぶたん（kabutan.jp）個別2ページ — 古い順に N 銘柄/回のローテーション
+                      予想EPS・予想1株配・BPS・発行済株式数・ROE・自己資本比率・
+                      通期業績（売上/営業益/純利益/EPS/配当、会社予想行つき）
 
-  1. 株価・30日終値   : yf.download の一括バッチ（毎回・全銘柄・数分）
-  2. 投資指標(.info)  : PER/PBR/ROE/利回り/時価総額 — 古い順に N 銘柄/回のローテーション
-  3. 財務諸表         : 損益計算書/自己資本比率/年別配当 — 古い順に M 銘柄/回のローテーション
-
-ローテーションにより数日〜1週間で全銘柄を一巡し、以降は鮮度順に更新し続ける。
-失敗した銘柄・項目は既存JSONの値を温存する。
+  ※Yahoo(.info)の日本株ファンダはEPS・発行済株式数が古く不正確なため使わない（2026-07確認。
+    例: 日本製鉄PERが166倍と表示される等）。PER/PBR/利回り/時価総額の比率は
+    ビルド時に「1株あたり値 × 最新株価」で毎日再計算する（四季報・証券会社と同じ予想ベース）。
 
 使い方:
-  python3 scripts/fetch_data.py                # 株価全銘柄 + 指標600 + 財務250（日次想定）
-  python3 scripts/fetch_data.py --fund 1500 --fin 400   # 初回など多めに
-  python3 scripts/fetch_data.py --prices-only  # 株価だけ素早く
+  python3 scripts/fetch_data.py                 # 株価全銘柄 + かぶたん500銘柄
+  python3 scripts/fetch_data.py --kabutan 800   # ローテーション件数を増やす
+  python3 scripts/fetch_data.py --prices-only
 """
 import argparse
 import datetime
 import json
+import re
 import sys
+import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -30,9 +33,11 @@ ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
 
 try:
+    import requests
+    from bs4 import BeautifulSoup
     import yfinance as yf
-except ImportError:
-    print("[ERROR] yfinance が必要です: pip install yfinance", file=sys.stderr)
+except ImportError as e:
+    print(f"[ERROR] 依存パッケージ不足: {e}（pip install -r scripts/requirements.txt）", file=sys.stderr)
     sys.exit(1)
 
 JST = datetime.timezone(datetime.timedelta(hours=9))
@@ -40,6 +45,8 @@ NOW = datetime.datetime.now(JST).isoformat(timespec="seconds")
 TODAY = NOW[:10]
 
 MARKET_PRIORITY = {"プライム": 0, "スタンダード": 1, "グロース": 2}
+UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"}
+KABUTAN_WAIT = 0.25  # リクエスト間隔（礼儀）
 
 INDICES = [
     ("日経平均", "^N225"),
@@ -75,7 +82,7 @@ def load_master():
 # ---------------------------------------------------------------- 1. 株価一括
 
 def fetch_prices(codes, market):
-    """yf.download で全銘柄の株価と30日終値を一括取得"""
+    """yfinance で全銘柄の（無調整）終値と30日推移を一括取得"""
     CHUNK = 400
     ok = 0
     for i in range(0, len(codes), CHUNK):
@@ -84,7 +91,7 @@ def fetch_prices(codes, market):
         try:
             df = yf.download(tickers, period="2mo", interval="1d",
                              group_by="ticker", threads=True, progress=False,
-                             auto_adjust=True)
+                             auto_adjust=False)  # 証券会社表示と同じ「実際の終値」を使う
         except Exception as e:
             print(f"[WARN] price chunk {i}: {e}", file=sys.stderr)
             continue
@@ -106,122 +113,236 @@ def fetch_prices(codes, market):
     return ok
 
 
-# ---------------------------------------------------------------- 2. 指標(.info)
+# ---------------------------------------------------------------- 2. かぶたん
 
-def fetch_fund(code):
-    info = yf.Ticker(f"{code}.T").info or {}
-    roe = info.get("returnOnEquity")
-    out = {
-        "per": round(info["trailingPE"], 1) if info.get("trailingPE") else None,
-        "pbr": round(info["priceToBook"], 2) if info.get("priceToBook") else None,
-        "roe": round(roe * 100, 1) if roe is not None else None,
-        "yield": round(info["dividendYield"], 2) if info.get("dividendYield") else None,
-        "mcap": round(info["marketCap"] / 1e8) if info.get("marketCap") else None,
-        "eps": round(info["trailingEps"], 1) if info.get("trailingEps") else None,
-    }
-    if not any(v is not None for v in out.values()):
-        raise ValueError("no data")
-    return out
+def _num(text):
+    """'2,746' '11.2' '－' → float or None"""
+    t = str(text).replace(",", "").replace("－", "").replace("―", "").replace("‐", "").strip()
+    t = t.replace("倍", "").replace("％", "").replace("%", "").replace("円", "").replace("株", "").strip()
+    if not t or t in ("-", "—"):
+        return None
+    try:
+        return float(t)
+    except ValueError:
+        return None
 
 
-# ---------------------------------------------------------------- 3. 財務諸表
+def _cells(tbl):
+    return [c.get_text(strip=True) for c in tbl.find_all(["th", "td"])]
 
-def fetch_fin(code):
-    t = yf.Ticker(f"{code}.T")
+
+# 決算期セルは「I2023.03」「連2002.03」「I予2027.03」のように種別マークと同居する
+DATE_RE = re.compile(r"\d{4}\.\d{2}")
+
+
+def _find_date_cell(tds):
+    """決算期らしいセルの位置を返す（長文セルの誤マッチは除外）"""
+    for k, t in enumerate(tds):
+        if len(t) <= 12 and DATE_RE.search(t):
+            return k
+    return None
+
+
+def parse_kabutan_main(soup):
+    """個別ページ → 基準株価・PER/PBR/利回り・時価総額・発行済株式数"""
     out = {}
-    try:
-        inc = t.income_stmt
-        cols = sorted(inc.columns)[-5:]
-        if len(cols) == 0:
-            raise ValueError("empty income_stmt")
-
-        def row(name, alt=None):
-            for key in filter(None, [name, alt]):
-                if key in inc.index:
-                    return [round(float(inc.at[key, c]) / 1e8) if inc.at[key, c] == inc.at[key, c] else None
-                            for c in cols]
-            return None
-
-        def row_raw(name):
-            if name in inc.index:
-                return [round(float(inc.at[name, c]), 1) if inc.at[name, c] == inc.at[name, c] else None
-                        for c in cols]
-            return None
-
-        fin = {
-            "years": [f"{c.year}/{c.month}" for c in cols],
-            "revenue": row("Total Revenue"),
-            "op": row("Operating Income", "Pretax Income"),
-            "net": row("Net Income"),
-            "eps": row_raw("Basic EPS") or row_raw("Diluted EPS"),
-        }
-        if fin["revenue"] and fin["net"]:
-            out.update(fin)
-    except Exception:
-        pass
-    try:
-        bs = t.balance_sheet
-        col = sorted(bs.columns)[-1]
-        eq = float(bs.at["Stockholders Equity", col])
-        ta = float(bs.at["Total Assets", col])
-        out["equity"] = round(eq / ta * 100, 1)
-    except Exception:
-        pass
-    try:
-        div = t.dividends
-        if len(div):
-            by_year = div.groupby(div.index.year).sum()
-            out["div_by_year"] = {str(y): round(float(v), 1) for y, v in by_year.tail(6).items()}
-    except Exception:
-        pass
-    if not out:
-        raise ValueError("no data")
+    kabuka = soup.select_one("span.kabuka")
+    if kabuka:
+        out["k_price"] = _num(kabuka.get_text(strip=True))
+    for tbl in soup.find_all("table"):
+        cells = _cells(tbl)
+        if "信用倍率" in cells and "PER" in cells:
+            # 値セルは「11.5倍」「0.87倍」「3.42％」のように単位込みで並ぶ
+            # （単位が別セルに分かれるケースにも耐えるよう、数値だけを順に拾う）
+            i = cells.index("信用倍率")
+            end = cells.index("時価総額") if "時価総額" in cells[i:] else min(i + 9, len(cells))
+            if "時価総額" in cells:
+                end = cells.index("時価総額")
+            nums = [v for v in (_num(c) for c in cells[i + 1:end]) if v is not None]
+            if len(nums) >= 3:
+                out["k_per"], out["k_pbr"], out["k_yield"] = nums[0], nums[1], nums[2]
+        if "発行済株式数" in cells:
+            j = cells.index("発行済株式数")
+            out["shares"] = _num(cells[j + 1]) if j + 1 < len(cells) else None
+        if "時価総額" in cells and "mcap_k" not in out:
+            j = cells.index("時価総額")
+            # 「42兆6,611億円」（1セル）にも「41|兆|2,746|億円」（分割）にも対応
+            text = "".join(cells[j + 1: j + 5])
+            m = re.search(r"(?:([\d,]+)兆)?\s*([\d,]+)?億", text)
+            if m:
+                mcap = 0.0
+                if m.group(1):
+                    mcap += float(m.group(1).replace(",", "")) * 10000
+                if m.group(2):
+                    mcap += float(m.group(2).replace(",", ""))
+                if mcap:
+                    out["mcap_k"] = round(mcap)
     return out
 
 
-# ---------------------------------------------------------------- rotation
+def parse_kabutan_finance(soup):
+    """財務ページ → 通期業績（予想行つき）・ROE・自己資本比率・1株純資産"""
+    out = {}
+    fin_rows = []
+    for tbl in soup.find_all("table"):
+        cells = _cells(tbl)
+        head = "".join(cells[:12])
+        # 通期業績テーブル（決算期/売上高/…/発表日。修正履歴テーブルは除外）
+        if not fin_rows and "決算期" in head and "売上高" in head and "発表日" in head and "修正日" not in head:
+            for tr in tbl.find_all("tr"):
+                tds = [c.get_text(strip=True) for c in tr.find_all(["td", "th"])]
+                k = _find_date_cell(tds)
+                if k is None:
+                    continue
+                vals = tds[k + 1: k + 7]
+                if len(vals) < 6:
+                    continue
+                rev, op, ordi, net, eps, div = (_num(v) for v in vals)
+                if rev is None and net is None and eps is None:
+                    continue
+                fin_rows.append({
+                    "year": DATE_RE.search(tds[k]).group(0),
+                    "fc": "予" in "".join(tds[:k + 1]),
+                    "revenue": round(rev / 100) if rev is not None else None,  # 百万円→億円
+                    "op": round(op / 100) if op is not None else None,
+                    "net": round(net / 100) if net is not None else None,
+                    "eps": eps, "div": div,
+                })
+        # ROEテーブル（決算期|売上高|営業益|利益率|ＲＯＥ|ＲＯＡ|…）
+        if "ＲＯＥ" in cells:
+            actual = []
+            for tr in tbl.find_all("tr"):
+                tds = [c.get_text(strip=True) for c in tr.find_all(["td", "th"])]
+                k = _find_date_cell(tds)
+                if k is None:
+                    continue
+                if "予" in "".join(tds[:k + 1]):
+                    continue
+                roe = _num(tds[k + 4]) if k + 4 < len(tds) else None
+                if roe is not None:
+                    actual.append(roe)
+            if actual:
+                out["roe"] = actual[-1]
+        # 財務テーブル（決算期|１株純資産|自己資本比率|…）
+        if "自己資本比率" in cells and "決算期" in cells:
+            for tr in tbl.find_all("tr"):
+                tds = [c.get_text(strip=True) for c in tr.find_all(["td", "th"])]
+                k = _find_date_cell(tds)
+                if k is None:
+                    continue
+                bps = _num(tds[k + 1]) if k + 1 < len(tds) else None
+                eq = _num(tds[k + 2]) if k + 2 < len(tds) else None
+                if bps is not None:
+                    out["bps"] = bps
+                if eq is not None:
+                    out["equity"] = eq
+    if fin_rows:
+        out["fin_rows"] = fin_rows[-6:]  # 実績最大5期 + 会社予想1行
+    return out
+
+
+def fetch_kabutan(code):
+    """かぶたん2ページ → (market用レコード, financials用レコード)"""
+    ses = requests.Session()
+    r1 = ses.get(f"https://kabutan.jp/stock/?code={code}", headers=UA, timeout=20)
+    time.sleep(KABUTAN_WAIT)
+    r2 = ses.get(f"https://kabutan.jp/stock/finance?code={code}", headers=UA, timeout=20)
+    time.sleep(KABUTAN_WAIT)
+    if r1.status_code != 200 and r2.status_code != 200:
+        raise ValueError(f"http {r1.status_code}/{r2.status_code}")
+    out = {}
+    if r1.status_code == 200:
+        out.update(parse_kabutan_main(BeautifulSoup(r1.text, "html.parser")))
+    if r2.status_code == 200:
+        out.update(parse_kabutan_finance(BeautifulSoup(r2.text, "html.parser")))
+
+    # ビルド時に最新株価から比率を再計算できるよう「1株あたり値」に還元して保存
+    price = out.get("k_price")
+    fin = out.get("fin_rows") or []
+    fc = next((r for r in reversed(fin) if r["fc"]), None)
+    last_actual = next((r for r in reversed(fin) if not r["fc"]), None)
+    rec = {}
+    eps_src = fc if (fc and fc.get("eps") is not None) else last_actual
+    if eps_src and eps_src.get("eps") is not None:
+        rec["eps_f"] = eps_src["eps"]          # 予想EPS（無ければ直近実績）
+        rec["eps_fc"] = bool(eps_src["fc"])
+    elif price and out.get("k_per"):
+        rec["eps_f"] = round(price / out["k_per"], 1)
+        rec["eps_fc"] = True
+    div_src = fc if (fc and fc.get("div") is not None) else last_actual
+    if div_src and div_src.get("div") is not None:
+        rec["dps"] = div_src["div"]            # 予想1株配（無ければ直近実績）
+    elif price and out.get("k_yield") is not None:
+        rec["dps"] = round(price * out["k_yield"] / 100, 1)
+    # BPSはかぶたん表示のPBR（直近四半期ベース）から逆算する方を優先し、財務テーブル（年度末）はフォールバック
+    if price and out.get("k_pbr"):
+        rec["bps"] = round(price / out["k_pbr"], 1)
+    elif out.get("bps") is not None:
+        rec["bps"] = out["bps"]
+    if out.get("shares"):
+        rec["shares"] = out["shares"]
+    elif price and out.get("mcap_k"):
+        rec["shares"] = round(out["mcap_k"] * 1e8 / price)
+    if out.get("roe") is not None:
+        rec["roe"] = out["roe"]
+    if out.get("equity") is not None:
+        rec["equity"] = out["equity"]
+
+    fin_out = None
+    if fin:
+        fin_out = {
+            "years": [r["year"].replace(".", "/").replace("/0", "/") + ("(予)" if r["fc"] else "") for r in fin],
+            "revenue": [r["revenue"] for r in fin],
+            "op": [r["op"] for r in fin],
+            "net": [r["net"] for r in fin],
+            "eps": [r["eps"] for r in fin],
+            "div": [r["div"] for r in fin],
+        }
+    if not rec and not fin_out:
+        raise ValueError("parse failed")
+    return rec, fin_out
+
 
 def pick_rotation(master, store, date_key, limit):
-    """更新が古い順に limit 件選ぶ。同日付なら「前回失敗（データ無し）」→プライムの順で優先"""
+    """更新が古い順に limit 件。同日付なら「前回失敗（データ無し）」→プライムの順"""
     def key(s):
         rec = store.get(s["code"], {})
-        has_data = any(v is not None for k, v in rec.items()
-                       if k not in (date_key, "date", "price", "chg", "hist"))
+        has_data = any(rec.get(k) is not None for k in ("eps_f", "bps", "shares", "roe"))
         return (rec.get(date_key, "0000-00-00"), 1 if has_data else 0,
                 MARKET_PRIORITY.get(s["market"], 9), s["code"])
     return [s["code"] for s in sorted(master, key=key)[:limit]]
 
 
-def run_rotation(label, codes, fn, store, date_key, workers=4):
+def run_kabutan_rotation(codes, market, financials, workers=3):
     ok = err = 0
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(fn, c): c for c in codes}
+        futs = {ex.submit(fetch_kabutan, c): c for c in codes}
         for fut in as_completed(futs):
             code = futs[fut]
+            rec_m = market.setdefault(code, {})
             try:
-                data = fut.result()
-                rec = store.setdefault(code, {})
-                rec.update({k: v for k, v in data.items() if v is not None})
-                rec[date_key] = TODAY
+                rec, fin_out = fut.result()
+                rec_m.update(rec)
+                rec_m["kabu_date"] = TODAY
+                if fin_out:
+                    financials[code] = fin_out
+                    financials[code]["fin_date"] = TODAY
                 ok += 1
             except Exception:
-                # 取得失敗でも日付は進めて、翌回は別の銘柄に枠を回す
-                store.setdefault(code, {})[date_key] = TODAY
+                rec_m["kabu_date"] = TODAY  # 失敗しても日付は進め、翌回は別銘柄に枠を回す
                 err += 1
-            if (ok + err) % 200 == 0:
-                print(f"  {label} {ok + err}/{len(codes)}")
-    print(f"{label}: {ok} OK / {err} NG")
-    return ok
+            if (ok + err) % 100 == 0:
+                print(f"  kabutan {ok + err}/{len(codes)}")
+    print(f"kabutan: {ok} OK / {err} NG")
 
 
 # ---------------------------------------------------------------- main
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--fund", type=int, default=600, help="指標(.info)を更新する銘柄数/回")
-    ap.add_argument("--fin", type=int, default=250, help="財務諸表を更新する銘柄数/回")
+    ap.add_argument("--kabutan", type=int, default=500, help="かぶたんで指標・財務を更新する銘柄数/回")
     ap.add_argument("--prices-only", action="store_true")
-    ap.add_argument("--skip-prices", action="store_true", help="株価一括をスキップして指標・財務だけ")
+    ap.add_argument("--skip-prices", action="store_true")
     args = ap.parse_args()
 
     master = load_master()
@@ -237,15 +358,10 @@ def main():
         save(DATA / "market.json", market)
 
     if not args.prices_only:
-        print(f"=== 投資指標ローテーション（{args.fund}銘柄） ===")
-        rot = pick_rotation(master, market, "fund_date", args.fund)
-        run_rotation("fund", rot, fetch_fund, market, "fund_date")
+        print(f"=== かぶたん指標・財務ローテーション（{args.kabutan}銘柄） ===")
+        rot = pick_rotation(master, market, "kabu_date", args.kabutan)
+        run_kabutan_rotation(rot, market, financials)
         save(DATA / "market.json", market)
-
-        print(f"=== 財務諸表ローテーション（{args.fin}銘柄） ===")
-        rot = pick_rotation(master, financials, "fin_date", args.fin)
-        # 財務諸表エンドポイントはスロットリングされやすいため並列を絞る
-        run_rotation("fin", rot, fetch_fin, financials, "fin_date", workers=2)
         save(DATA / "financials.json", financials)
 
     idx = load_existing(DATA / "indices.json")

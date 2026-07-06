@@ -89,33 +89,47 @@ def auto_desc(s):
 
 
 def build_stocks():
+    """マスタ＋実データをマージ。PER/PBR/利回り/時価総額は
+    かぶたん由来の1株あたり値（予想EPS・BPS・予想1株配・株数）×最新株価で毎日再計算する。"""
     stocks = []
     for row in MASTER:
         s = dict(row)
         live = MARKET_DATA.get(s["code"], {})
-        for k in ("price", "chg", "per", "pbr", "roe", "yield", "mcap", "eps", "hist"):
+        for k in ("price", "chg", "hist", "roe", "equity", "eps_fc"):
             if live.get(k) is not None:
                 s[k] = live[k]
+        price = s.get("price")
+        if price:
+            eps_f = live.get("eps_f")
+            if eps_f is not None:
+                s["per"] = round(price / eps_f, 1) if eps_f > 0 else None
+            bps = live.get("bps")
+            if bps:
+                s["pbr"] = round(price / bps, 2)
+            dps = live.get("dps")
+            if dps is not None:
+                s["yield"] = round(dps / price * 100, 2)
+                s["dps"] = dps
+            shares = live.get("shares")
+            if shares:
+                s["mcap"] = round(price * shares / 1e8)  # 億円
+
         fin = FINANCIALS.get(s["code"], {})
-        if fin.get("equity") is not None:
-            s["equity"] = fin["equity"]
         if fin.get("revenue"):
             rows = []
             for i, yr in enumerate(fin["years"]):
-                rev = fin["revenue"][i]
-                if rev is None:
+                vals = [(fin.get(k2) or [None] * 9)[i] for k2 in ("revenue", "net", "eps")]
+                if all(v is None for v in vals):
                     continue
-                rows.append({"year": yr, "revenue": rev,
+                rows.append({"year": yr,
+                             "revenue": fin["revenue"][i],
                              "op": (fin.get("op") or [None] * 9)[i],
                              "net": (fin.get("net") or [None] * 9)[i],
-                             "eps": (fin.get("eps") or [None] * 9)[i]})
+                             "eps": (fin.get("eps") or [None] * 9)[i],
+                             "div": (fin.get("div") or [None] * 9)[i]})
             if rows:
                 s["fin_rows"] = rows
-        dby = fin.get("div_by_year")
-        if dby:
-            done = [(y, v) for y, v in sorted(dby.items()) if int(y) < THIS_YEAR]
-            if done:
-                s["div_rows"] = done[-5:]
+                s["div_rows"] = [(r["year"], r["div"]) for r in rows if r["div"] is not None]
         stocks.append(s)
     return stocks
 
@@ -375,7 +389,7 @@ FOOTER = f"""
       <a href="/sector/index.html">業種別</a>
       <a href="/about.html">このサイトについて・免責事項</a>
     </nav>
-    <p class="disclaimer">株価・財務データはYahoo!ファイナンス等の公開情報を基に自動取得しています（最終更新: {UPDATED_DATE}）。
+    <p class="disclaimer">株価・財務データは株探・Yahoo!ファイナンス等の公開情報を基に自動取得しています（最終更新: {UPDATED_DATE}）。PERは原則、会社予想EPSベースです。
     データには遅延・誤差が含まれる場合があり、正確性・完全性を保証しません。当サイトの情報は投資勧誘を目的としたものではなく、
     投資判断は必ずご自身の責任で行ってください。</p>
     <p class="copy">© 2026 株式調査兵団</p>
@@ -487,7 +501,7 @@ RANKINGS = {
         "desc": f"PER（株価収益率）が低い割安株ランキングTOP{RANK_LIMIT}【毎営業日更新】。バリュー投資のスクリーニングに。",
         "key": lambda s: s.get("per") or 9999, "reverse": False,
         "fmt": per_disp,
-        "note": "PER＝株価 ÷ 1株あたり利益（EPS）。低いほど利益に対して株価が割安。",
+        "note": "PER＝株価 ÷ 1株あたり利益（原則、会社予想EPS）。低いほど利益に対して株価が割安。",
     },
     "pbr": {
         "title": "低PBRランキング", "need": "pbr", "filter_mcap": True,
@@ -728,7 +742,7 @@ def stock_faq(s):
     if s.get("per"):
         level = "割安" if s["per"] < 12 else ("平均的" if s["per"] < 18 else "割高")
         qa.append((f"{name}のPERは割安ですか？",
-                   f"PERは{s['per']:.1f}倍で、市場平均（約15倍）と比較すると{level}な水準です。PERのみで判断せず、成長性や業種特性も考慮してください。"))
+                   f"{'予想' if s.get('eps_fc') else '実績'}PERは{s['per']:.1f}倍で、市場平均（約15倍）と比較すると{level}な水準です。PERのみで判断せず、成長性や業種特性も考慮してください。"))
     if s.get("mcap"):
         qa.append((f"{name}の時価総額はいくらですか？",
                    f"{UPDATED_DATE}時点の時価総額は約{fmt_oku(s['mcap'])}です。"))
@@ -823,7 +837,7 @@ def build_stock_pages(stocks, grouped):
     <tbody>{fin_rows_html}</tbody>
   </table>
   </div>
-  <p class="table-note">出典: Yahoo!ファイナンス等の公開情報より自動取得。「—」は取得不可の項目。</p>
+  <p class="table-note">出典: 株探等の公開情報より自動取得。「(予)」は会社予想、「—」は取得不可の項目。</p>
 </section>"""
 
         faq_html, faq_ld = stock_faq(s)
@@ -853,16 +867,16 @@ def build_stock_pages(stocks, grouped):
     {sparkline(s, w=160, h=44)}
   </div>
 </div>
-<p class="updated-note">最終更新: {UPDATED_DATE}（Yahoo!ファイナンス等の公開情報より自動取得）</p>
+<p class="updated-note">最終更新: {UPDATED_DATE}（株探・Yahoo!ファイナンス等の公開情報より自動取得）</p>
 
 <section class="sec">
   {kicker("KEY METRICS", "主要計器")}
   <h2>投資指標</h2>
   <div class="metric-grid">
-    {metric_card("PER（株価収益率）", per_disp(s), "15倍前後が市場平均の目安")}
+    {metric_card("PER（" + ("会社予想" if s.get("eps_fc") else "実績") + "）", per_disp(s), "15倍前後が市場平均の目安")}
     {metric_card("PBR（株価純資産倍率）", f"{s['pbr']:.2f}倍" if s.get('pbr') else "—", "1倍未満は解散価値割れ")}
     {metric_card("ROE（自己資本利益率）", f"{s['roe']:.1f}%" if s.get('roe') is not None else "—", "8%以上で資本効率良好")}
-    {metric_card("配当利回り", f"{s['yield']:.2f}%" if s.get('yield') is not None else "—", "東証プライム平均は約2%")}
+    {metric_card("配当利回り（予想）", f"{s['yield']:.2f}%" if s.get('yield') is not None else "—", "東証プライム平均は約2%")}
     {metric_card("時価総額", fmt_oku_or_dash(s.get('mcap')))}
     {metric_card("自己資本比率", f"{s['equity']:.1f}%" if s.get('equity') is not None else "—", "財務健全性の目安")}
   </div>
@@ -1019,7 +1033,8 @@ def build_about(n_stocks):
 <h2>データについて</h2>
 <ul class="plain-list">
 <li>銘柄マスタは日本取引所グループ（JPX）公表の東証上場銘柄一覧にもとづきます。</li>
-<li>株価・投資指標・財務データはYahoo!ファイナンス等の公開情報を基に、毎営業日プログラムで自動取得しています。</li>
+<li>株価はYahoo!ファイナンス、投資指標・財務データは株探（kabutan.jp）等の公開情報を基に、毎営業日プログラムで自動取得しています。</li>
+<li>PER・配当利回りは原則、会社予想ベース（予想が無い銘柄は直近実績ベース）です。PER・PBR・利回り・時価総額は最新株価で毎日再計算しています。</li>
 <li>データには遅延（通常20分以上）や誤差が含まれる場合があります。投資指標・財務諸表は銘柄ごとに数日周期で巡回更新しているため、更新タイミングに差があります。</li>
 <li>分析レポートは指標のしきい値にもとづく機械的な自動生成であり、個別の投資助言ではありません。</li>
 <li>最終更新: {UPDATED_DATE}</li>

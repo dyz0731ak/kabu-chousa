@@ -47,9 +47,9 @@ jobs:
           fi
         continue-on-error: true
 
-      - name: Fetch market data (yfinance)
+      - name: Fetch market data (株価=yfinance / 指標・財務=かぶたん)
         if: github.event_name != 'push'
-        run: python scripts/fetch_data.py --fund 600 --fin 250
+        run: python scripts/fetch_data.py --kabutan 500
         continue-on-error: true   # 取得失敗時は前回データでビルド
 
       - name: Build site
