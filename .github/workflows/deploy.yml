@@ -54,7 +54,7 @@ jobs:
 
       - name: Build site
         env:
-          BASE_URL: ${{ vars.BASE_URL || 'https://kabu-chousa.com' }}
+          BASE_URL: ${{ vars.BASE_URL || 'https://kabu-chousa.site' }}
         run: python build.py
 
       - name: Commit updated data

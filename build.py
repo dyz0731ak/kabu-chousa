@@ -22,7 +22,7 @@ from data import DESC_OVERRIDES, MARKET_SUMMARY
 ROOT = Path(__file__).parent
 DIST = ROOT / "dist"
 DATA = ROOT / "data"
-BASE_URL = os.environ.get("BASE_URL", "https://kabu-chousa.com").rstrip("/")
+BASE_URL = os.environ.get("BASE_URL", "https://kabu-chousa.site").rstrip("/")
 SITE_NAME = "株式調査兵団"
 SITE_TAGLINE = "日本株全上場銘柄の企業分析・銘柄ランキング"
 SITE_DESC = ("東証プライム・スタンダード・グロース全上場銘柄の財務データ分析とランキングで"
